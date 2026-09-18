@@ -32,6 +32,9 @@ function useToast() {
   return { toasts, show };
 }
 
+// add this line
+const API = import.meta.env.VITE_API_URL;
+
 /* ─── helpers ─────────────────────────────────────────────────── */
 const INR = (v) => (v != null ? `₹${Number(v).toLocaleString("en-IN")}` : "N/A");
 
@@ -158,7 +161,8 @@ export default function ProductDetails() {
     setLoading(true);
     try {
       // FIXED: correct URL template
-      const { data } = await axios.get(`http://localhost:3000/api/products/${id}`);
+      // const { data } = await axios.get(`http://localhost:3000/api/products/${id}`);
+      const { data } = await axios.get(`${API}/api/products/${id}`);
       setProduct(data.product);
     } catch (err) {
       console.error("fetchProduct error:", err?.response?.data || err.message);
@@ -278,7 +282,8 @@ export default function ProductDetails() {
     setAiResult(null);
 
     // Try POST first (many of your earlier routes used POST), fallback to GET
-    const nodeUrl = `http://localhost:3000/api/products/${product._id}/predict`;
+    // const nodeUrl = `http://localhost:3000/api/products/${product._id}/predict`;
+    const nodeUrl = `${API}/api/products/${product._id}/predict`;
 
     try {
       let resp;
