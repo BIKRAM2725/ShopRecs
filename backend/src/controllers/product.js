@@ -403,9 +403,7 @@ export const predictProduct = async (req, res) => {
     try {
         const { id } = req.params;
 
-        // ==============================================
-        // 1. FETCH PRODUCT FROM DATABASE
-        // ==============================================
+
 
         const product = await TrackedProduct
             .findById(id)
@@ -418,9 +416,6 @@ export const predictProduct = async (req, res) => {
             });
         }
 
-        // ==============================================
-        // 2. BUILD PAYLOAD FOR FASTAPI
-        // ==============================================
 
         const payload = {
             product: {
@@ -440,9 +435,7 @@ export const predictProduct = async (req, res) => {
             },
         };
 
-        // ==============================================
-        // 3. CALL FASTAPI
-        // ==============================================
+
 
         const axiosConfig = {
             timeout: 20000,
@@ -477,9 +470,7 @@ export const predictProduct = async (req, res) => {
             });
         }
 
-        // ==============================================
-        // 4. RETURN FASTAPI RESULT TO FRONTEND
-        // ==============================================
+    
 
         return res.status(200).json({
             success: true,
