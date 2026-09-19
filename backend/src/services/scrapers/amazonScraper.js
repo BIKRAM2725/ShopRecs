@@ -47,9 +47,9 @@ export const scrapeAmazon = async (url) => {
         let mrp = "";
         let inStock = true;
 
-        // -------------------------
+        
         // JSON-LD
-        // -------------------------
+        
 
         $('script[type="application/ld+json"]').each(
             (_, element) => {
@@ -148,9 +148,9 @@ export const scrapeAmazon = async (url) => {
             }
         );
 
-        // -------------------------
+        
         // Title fallback
-        // -------------------------
+        
 
         if (!title) {
             title = $(
@@ -160,9 +160,9 @@ export const scrapeAmazon = async (url) => {
                 .trim();
         }
 
-        // -------------------------
+        
         // Current Price
-        // -------------------------
+        
 
         if (!currentPrice) {
             const selectors = [
@@ -198,9 +198,9 @@ export const scrapeAmazon = async (url) => {
             }
         }
 
-        // -------------------------
+        
         // MRP
-        // -------------------------
+        
 
         if (!mrp) {
             const selectors = [
@@ -239,9 +239,9 @@ export const scrapeAmazon = async (url) => {
         mrp =
             cleanPrice(mrp);
 
-        // -------------------------
+        
         // Image
-        // -------------------------
+        
 
         if (!image) {
             image =
@@ -253,9 +253,9 @@ export const scrapeAmazon = async (url) => {
                 "";
         }
 
-        // -------------------------
+        
         // Brand
-        // -------------------------
+        
 
         let brand = $(
             "#bylineInfo"
@@ -276,9 +276,9 @@ export const scrapeAmazon = async (url) => {
             )
             .trim();
 
-        // -------------------------
+        
         // Category
-        // -------------------------
+        
 
         const category = $(
             "#wayfinding-breadcrumbs_feature_div ul li"
@@ -287,9 +287,9 @@ export const scrapeAmazon = async (url) => {
             .text()
             .trim();
 
-        // -------------------------
+        
         // Model Number
-        // -------------------------
+        
 
         let modelNumber = "";
 
@@ -318,9 +318,9 @@ export const scrapeAmazon = async (url) => {
             }
         );
 
-        // -------------------------
+        
         // ASIN / Product Key
-        // -------------------------
+        
 
         const asinText = $("tr")
             .filter(
@@ -352,9 +352,9 @@ export const scrapeAmazon = async (url) => {
             asin ||
             extractProductKey(url);
 
-        // -------------------------
+        
         // Specifications
-        // -------------------------
+        
 
         const specifications = {};
 
@@ -397,9 +397,7 @@ export const scrapeAmazon = async (url) => {
             }
         );
 
-        // -------------------------
-        // Stock
-        // -------------------------
+      
 
         const stockText = $(
             "#availability"
@@ -419,9 +417,7 @@ export const scrapeAmazon = async (url) => {
             inStock = false;
         }
 
-        // -------------------------
-        // Normalize Prices
-        // -------------------------
+    
 
         const priceData =
             normalizePrices(
@@ -447,9 +443,7 @@ export const scrapeAmazon = async (url) => {
             return null;
         }
 
-        // -------------------------
-        // Final Result
-        // -------------------------
+     
 
         return {
             source: "amazon",
