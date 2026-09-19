@@ -13,100 +13,85 @@ import json
 import re
 import time
 from typing import Optional, Dict, Any
-import logging
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("price-analyst")
-
-# --- Environment / config ---
+# ---- Config / env ----
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 LLM_ENDPOINT = os.getenv(
     "LLM_ENDPOINT",
     "https://api.groq.com/openai/v1/chat/completions"
 )
-
 LLM_MODEL = os.getenv(
     "LLM_MODEL",
     "openai/gpt-oss-20b"
 )
-
 OLLAMA_URL = os.getenv("OLLAMA_URL")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
-USE_OLLAMA_FALLBACK = os.getenv("USE_OLLAMA_FALLBACK", "false").lower() in ("1", "true", "yes")
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "llama2"
+)
+USE_OLLAMA_FALLBACK = (
+    os.getenv("USE_OLLAMA_FALLBACK", "false").lower() in ("1", "true", "yes")
+)
 
 MODEL_PATH = os.getenv("MODEL_PATH", "xgboost_price_model.pkl")
 ENCODERS_PATH = os.getenv("ENCODERS_PATH", "label_encoders.pkl")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # comma-separated or "*"
-
-# --- helper: parse allowed origins ---
-if ALLOWED_ORIGINS.strip() == "*":
-    cors_origins = ["*"]
-else:
-    cors_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
-
-# --- load model & encoders ---
+# ---- optional holiday engine ----
 try:
-    model = joblib.load(MODEL_PATH)
-    logger.info(f"Loaded model from {MODEL_PATH}")
-except Exception as e:
-    logger.exception(f"Failed to load model '{MODEL_PATH}': {e}")
-    raise RuntimeError(f"Failed to load model '{MODEL_PATH}': {e}")
-
-try:
-    encoders = joblib.load(ENCODERS_PATH)
-    logger.info(f"Loaded encoders from {ENCODERS_PATH}")
-except Exception as e:
-    encoders = {}
-    logger.warning(f"Warning: failed to load encoders '{ENCODERS_PATH}', continuing with empty encoders. Error: {e}")
-
-# --- try import holiday engine if provided ---
-try:
-    from utils.holiday_engine import get_event_context  # optional
+    from utils.holiday_engine import get_event_context
 except Exception:
     def get_event_context(source: str = "amazon"):
         return {"date": None, "platform": source, "is_sale_event": 0, "event_type": "regular"}
 
-# --- FastAPI app ---
-app = FastAPI(title="Price Prediction / Analyst")
+# ---- app + CORS ----
+app = FastAPI(title="Price Prediction / AI Analyst API")
 
-# CORS
+# Allow your frontend origins here (set to specific origins for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Pydantic input model ---
+# ---- model + encoders load ----
+try:
+    model = joblib.load(MODEL_PATH)
+except Exception as e:
+    raise RuntimeError(f"Failed to load model '{MODEL_PATH}': {e}")
+
+try:
+    encoders = joblib.load(ENCODERS_PATH)
+except Exception as e:
+    encoders = {}
+    print(f"Warning: failed to load encoders '{ENCODERS_PATH}', continuing with empty encoders. Error: {e}")
+
+# ---- pydantic input ----
 class ProductInput(BaseModel):
     product: Dict[str, Any]
 
-# --- utilities ---
-
-
+# ---- helpers ----
 def encode(col: str, value: Any) -> int:
     le = encoders.get(col)
     if not le:
         return 0
-    val = str(value)
+    value = str(value)
     try:
-        # scikit-learn LabelEncoder has attribute classes_
-        if hasattr(le, "classes_") and val in le.classes_:
-            return int(le.transform([val])[0])
+        if hasattr(le, "classes_") and value in le.classes_:
+            return int(le.transform([value])[0])
     except Exception:
         return 0
     return 0
 
-
 def detect_fake_discount(product: Dict[str, Any], avg_price: float) -> str:
+    mrp = product.get("mrp", 0) or 0
+    current = product.get("currentPrice", 0) or 0
     try:
-        mrp = float(product.get("mrp", 0) or 0)
-        current = float(product.get("currentPrice", 0) or 0)
+        mrp = float(mrp)
+        current = float(current)
     except Exception:
         return "Unknown"
     if mrp == 0:
@@ -115,7 +100,6 @@ def detect_fake_discount(product: Dict[str, Any], avg_price: float) -> str:
     if discount > 40 and abs(current - avg_price) < max(1.0, avg_price * 0.05):
         return "Fake"
     return "Genuine"
-
 
 def get_confidence(drop_percent: float, trend: float, volatility: float, event: Dict[str, Any]) -> str:
     score = 0
@@ -133,12 +117,11 @@ def get_confidence(drop_percent: float, trend: float, volatility: float, event: 
         return "Medium"
     return "Low"
 
-
 def extract_json_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
     if not text or not isinstance(text, str):
         return None
     s = text.strip()
-    # remove triple backticks wrapper, if present
+    # Remove triple backtick wrappers if present
     if s.startswith("```") and s.endswith("```"):
         parts = s.split("```")
         for part in reversed(parts):
@@ -155,24 +138,25 @@ def extract_json_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
         return json.loads(candidate)
     except Exception:
         try:
+            # try to quote unquoted keys and single quotes
             fixed = re.sub(r'([{\s,])([a-zA-Z0-9_]+)\s*:', r'\1"\2":', candidate)
             fixed = fixed.replace("'", '"')
             return json.loads(fixed)
         except Exception:
             return None
 
-
 def parse_kv_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
     if not text or not isinstance(text, str):
         return None
     lines = [line.strip() for line in re.split(r'[\r\n]+', text) if line.strip()]
     result: Dict[str, Any] = {}
-    # simple parse of "Key: value" or "Key - value"
+    # try key:value style lines
     for line in lines:
-        m = re.match(r'^\s\*?([A-Za-z0-9 _-]{2,60})\*?\s*[:\-]\s*(.+)$', line)
-        if m:
-            key = m.group(1).strip().lower()
-            value = m.group(2).strip()
+        # allow optional asterisks or emphasis around key
+        match = re.match(r'^\s\**?([A-Za-z ]{3,30})\**?\s*[:\-]\s*(.+)$', line)
+        if match:
+            key = match.group(1).strip().lower()
+            value = match.group(2).strip()
             if "action" in key:
                 result["action"] = value.upper()
             elif "confidence" in key:
@@ -183,14 +167,14 @@ def parse_kv_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
                 result["insight"] = value
     if result:
         return result
-    # fallback searches
+    # fallback patterns
     action_match = re.search(r'\b(BUY NOW|WAIT)\b', text, re.IGNORECASE)
     if action_match:
         result["action"] = action_match.group(0).upper()
     confidence_match = re.search(r'Confidence\s*[:\-]\s*(Low|Medium|High)', text, re.IGNORECASE)
     if confidence_match:
         result["confidence"] = confidence_match.group(1).title()
-    # choose a long sentence as explanation
+    # pick a long sentence as explanation
     sentences = re.split(r'(?<=[.!?])\s+', text)
     for sentence in sentences:
         if len(sentence.strip()) > 15 and "action" not in sentence.lower() and "confidence" not in sentence.lower():
@@ -198,28 +182,19 @@ def parse_kv_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
             break
     return result if result else None
 
-
+# ---- LLM / external calls (GROQ / Ollama) ----
 def call_groq(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Call GROQ (or configured LLM endpoint) to parse the prices + produce a decision.
-    Returns dict like {"parsed": {...}} or None.
-    """
     if not GROQ_API_KEY:
-        logger.debug("GROQ_API_KEY missing; skipping GROQ call.")
+        print("GROQ_API_KEY missing; skipping GROQ call.")
         return None
-
     system_instruction = (
-        "You are an expert ecommerce pricing analyst. "
-        "Think step-by-step internally but do not output chain-of-thought. "
-        "Use only the provided data. Return strict JSON. Use English only. "
-        "Do not include future numeric price predictions."
+        "You are an expert ecommerce pricing analyst. Think step-by-step internally but do not output chain-of-thought. "
+        "Use only the provided data. Return strict JSON. Use English only. Do not include future numeric price predictions."
     )
-
     event = payload.get("eventContext") or {}
     event_type = event.get("event_type", "unknown")
     is_sale_event = event.get("is_sale_event", 0)
     historical_prices = payload.get("prices", [])
-
     user_data = (
         "DATA:\n"
         f"- Current Price: {payload.get('currentPrice')}\n"
@@ -231,33 +206,19 @@ def call_groq(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         f"- Historical Prices: {json.dumps(historical_prices)}\n\n"
         "INSTRUCTIONS:\n"
         "Return exactly one JSON object:\n"
-        '{ "action": "BUY NOW" or "WAIT", "confidence": "Low"|"Medium"|"High", "explanation": "1-3 sentence explanation", "insight": "1-2 word insight" }\n'
+        "{\n  \"action\": \"BUY NOW\" or \"WAIT\",\n  \"confidence\": \"Low\", \"Medium\", or \"High\",\n  \"explanation\": \"1-3 sentence English explanation\",\n  \"insight\": \"1-2 word English insight\"\n}\n"
         "Do not output a future price. Do not output chain-of-thought. Use English only."
     )
-
-    body = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_data}
-        ],
-        "max_tokens": 400
-    }
-
+    body = {"model": LLM_MODEL, "messages": [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_data}], "max_tokens": 400}
     for attempt in range(2):
         try:
-            resp = requests.post(
-                LLM_ENDPOINT,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json=body,
-                timeout=15,
-            )
-            logger.debug("GROQ status: %s", resp.status_code)
-            if resp.status_code != 200:
-                logger.warning("GROQ error (%s): %s", resp.status_code, resp.text[:500])
+            response = requests.post(LLM_ENDPOINT, headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}, json=body, timeout=15)
+            print("GROQ STATUS:", response.status_code)
+            if response.status_code != 200:
+                print("GROQ ERROR BODY:", response.text[:1000])
                 time.sleep(0.5)
                 continue
-            data = resp.json()
+            data = response.json()
             raw = None
             try:
                 raw = data.get("choices", [])[0].get("message", {}).get("content")
@@ -280,10 +241,9 @@ def call_groq(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 return {"parsed": kv}
             return {"parsed": None}
         except Exception as e:
-            logger.exception("GROQ call exception: %s", e)
+            print("GROQ CALL EXCEPTION:", str(e))
             time.sleep(0.5)
     return None
-
 
 def call_ollama(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not OLLAMA_URL:
@@ -293,8 +253,7 @@ def call_ollama(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     is_sale_event = event.get("is_sale_event", 0)
     historical_prices = payload.get("prices", [])
     prompt = (
-        "You are an expert ecommerce pricing analyst. Use only the provided data. "
-        "Return exactly one JSON object. Use English only. Do not output a future price.\n\n"
+        "You are an expert ecommerce pricing analyst. Use only the provided data. Return exactly one JSON object. Use English only. Do not output a future price.\n\nDATA:\n"
         f"- Current Price: {payload.get('currentPrice')}\n"
         f"- Expected Drop Percent: {payload.get('expectedDropPercent')}\n"
         f"- Price Trend: {payload.get('priceTrend')}\n"
@@ -302,20 +261,15 @@ def call_ollama(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         f"- Event Type: {event_type}\n"
         f"- Is Sale Event: {is_sale_event}\n"
         f"- Historical Prices: {json.dumps(historical_prices)}\n\n"
-        "Schema: {\"action\":\"BUY NOW\"|\"WAIT\", \"confidence\":\"Low\"|\"Medium\"|\"High\", \"explanation\":\"...\",\"insight\":\"...\"}"
+        'Schema: {"action":"BUY NOW"|"WAIT","confidence":"Low"|"Medium"|"High","explanation":"English explanation","insight":"1-2 words"}'
     )
-
     try:
-        resp = requests.post(
-            f"{OLLAMA_URL.rstrip('/')}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "max_tokens": 400},
-            timeout=10,
-        )
-        logger.debug("OLLAMA status: %s", resp.status_code)
-        if resp.status_code != 200:
-            logger.warning("OLLAMA body: %s", resp.text[:500])
+        response = requests.post(f"{OLLAMA_URL.rstrip('/')}/api/generate", json={"model": OLLAMA_MODEL, "prompt": prompt, "max_tokens": 400}, timeout=10)
+        print("OLLAMA STATUS:", response.status_code)
+        if response.status_code != 200:
+            print("OLLAMA BODY:", response.text[:1000])
             return None
-        data = resp.json()
+        data = response.json()
         raw = None
         if isinstance(data, dict):
             raw = data.get("response") or (data.get("generations", [{}])[0].get("text") if data.get("generations") else None)
@@ -335,21 +289,19 @@ def call_ollama(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return {"parsed": kv}
         return {"parsed": None}
     except Exception as e:
-        logger.exception("OLLAMA exception: %s", e)
+        print("OLLAMA CALL EXCEPTION:", str(e))
         return None
-
 
 def call_llm_analytical(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     groq_response = call_groq(payload)
     if groq_response and groq_response.get("parsed"):
         return {"provider": "groq", **groq_response}
     if USE_OLLAMA_FALLBACK and OLLAMA_URL:
-        logger.info("GROQ failed or unparseable, trying Ollama fallback.")
+        print("GROQ failed/unparseable. Trying Ollama fallback.")
         ollama_response = call_ollama(payload)
         if ollama_response and ollama_response.get("parsed"):
             return {"provider": "ollama", **ollama_response}
     return None
-
 
 def fallback_decision(ml_result: Dict[str, Any]) -> Dict[str, Any]:
     drop = ml_result.get("expectedDropPercent", 0)
@@ -372,7 +324,6 @@ def fallback_decision(ml_result: Dict[str, Any]) -> Dict[str, Any]:
         insight = "Monitor"
     return {"action": action, "confidence": confidence, "explanation": explanation, "insight": insight}
 
-
 def short_insight(event: Dict[str, Any], volatility: float, drop_percent: float, trend: float) -> str:
     if event.get("is_sale_event") == 1:
         return "Sale imminent"
@@ -384,24 +335,20 @@ def short_insight(event: Dict[str, Any], volatility: float, drop_percent: float,
         return "Dropping"
     return "Monitor"
 
-# --- endpoints ---
-
-
+# ---- endpoints ----
 @app.get("/")
 def root():
     return {"status": "ok"}
-
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
-
 @app.post("/predict")
 def predict(data: ProductInput):
     product = data.product or {}
 
-    # parse numeric fields defensively
+    # parse inputs safely
     try:
         current_price = float(product.get("currentPrice", 0) or 0)
     except Exception:
@@ -420,11 +367,13 @@ def predict(data: ProductInput):
         review_count = 500.0
 
     discount_percent = ((mrp - current_price) / mrp * 100) if mrp > 0 else 0.0
+
     dt = datetime.now()
     is_weekend = 1 if dt.weekday() >= 5 else 0
-    event = get_event_context(product.get("source", "amazon")) or {}
-    history = product.get("history", []) or []
 
+    event = get_event_context(product.get("source", "amazon")) or {}
+
+    history = product.get("history", []) or []
     prices = []
     for item in history:
         try:
@@ -436,7 +385,7 @@ def predict(data: ProductInput):
         except Exception:
             continue
 
-    if len(prices) == 0 or (len(prices) > 0 and prices[-1] != current_price):
+    if len(prices) == 0 or prices[-1] != current_price:
         prices.append(current_price)
 
     avg_price = float(np.mean(prices)) if prices else current_price
@@ -469,19 +418,22 @@ def predict(data: ProductInput):
     try:
         predicted_price = float(model.predict(input_df)[0])
     except Exception as e:
-        logger.exception("Model predict error: %s", e)
-        raise HTTPException(status_code=500, detail={"success": False, "message": "Model prediction failed", "error": str(e)})
+        print("MODEL PREDICT ERROR:", str(e))
+        return {"success": False, "message": "Model prediction failed", "error": str(e)}
 
+    # simple fused future estimate
     future_price_internal = predicted_price * 0.2 + avg_price * 0.5 + current_price * 0.3
     if trend < 0:
         future_price_internal -= abs(trend) * 0.3
     elif trend > 0:
         future_price_internal += trend * 0.2
     future_price_internal = max(current_price * 0.8, min(future_price_internal, current_price * 1.2))
+
     difference = current_price - future_price_internal
     rule_recommendation = "WAIT" if difference > 100 else "BUY NOW"
     if event.get("is_sale_event"):
         rule_recommendation = "WAIT (SALE COMING)"
+
     drop_percent = (abs(difference) / current_price * 100) if current_price > 0 else 0.0
     discount_check = detect_fake_discount(product, avg_price)
     fallback_confidence = get_confidence(drop_percent, trend, volatility, event)
@@ -508,7 +460,6 @@ def predict(data: ProductInput):
         "prices": prices
     }
 
-    # try LLM parse (optional)
     llm_response = call_llm_analytical(llm_payload)
     explain_source = "llm"
     valid_actions = {"BUY NOW", "WAIT"}
@@ -530,13 +481,13 @@ def predict(data: ProductInput):
     final_action = llm_parsed.get("action", "WAIT")
     final_confidence = llm_parsed.get("confidence", fallback_confidence)
     final_explanation = llm_parsed.get("explanation", "")
-    # remove any accidental numeric "future price" mentions
-    final_explanation = re.sub(r'\b(futurePrice|future_price|predicted price|predicted)\b[:\s]*[\d,.]+', '', final_explanation, flags=re.IGNORECASE).strip()
+    final_explanation = re.sub(r'\b(futurePrice|future_price|predicted price|predicted)\b[:\s]*[\d,.\-]+', '', final_explanation, flags=re.IGNORECASE).strip()
     if not final_explanation:
-        if final_action == "WAIT":
-            final_explanation = "The current price trend and market conditions suggest waiting for a potentially better price."
-        else:
-            final_explanation = "The current price trend is stable and there is no strong indication of a significant price drop."
+        final_explanation = (
+            "The current price trend and market conditions suggest waiting for a potentially better price."
+            if final_action == "WAIT"
+            else "The current price trend is stable and there is no strong indication of a significant price drop."
+        )
 
     insight_short = short_insight(event, volatility, drop_percent, trend)
 
@@ -555,13 +506,7 @@ def predict(data: ProductInput):
         "discountCheck": discount_check,
         "avgHistoricalPrice": ml_result["avgHistoricalPrice"],
         "lowestHistoricalPrice": ml_result["lowestHistoricalPrice"],
-        "highestHistoricalPrice": ml_result["highestHistoricalPrice"],
+        "highestHistoricalPrice": ml_result["highestHistoricalPrice"]
     }
 
     return response
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
