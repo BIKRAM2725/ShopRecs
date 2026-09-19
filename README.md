@@ -1,4 +1,4 @@
-# ShopRecs – AI Powered Price Prediction & Recommendation System
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/dacbc7ac-c487-4920-8bfd-5674672bb9da" /># ShopRecs – AI Powered Price Prediction & Recommendation System
 
 🚀 Predicts future product prices using XGBoost and recommends whether to BUY or WAIT based on market trends.
 
@@ -6,7 +6,7 @@
 
 ## 🌐 Live Demo
 
-* 🔗 Frontend: https://shop-recs-utsf-m1962b60o-bikrams-projects-65c31b46.vercel.app/
+* 🔗 Frontend: https://shoprecs-4y87.onrender.com/
 * 🤖 AI Backend (FastAPI): https://shoprecs-1.onrender.com/
 * ⚙️ Backend (Node API): https://shoprecs.onrender.com/
 
