@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+# app.py
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -11,11 +13,14 @@ import json
 import re
 import time
 from typing import Optional, Dict, Any
-
+import logging
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("price-analyst")
 
+# --- Environment / config ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 LLM_ENDPOINT = os.getenv(
@@ -29,459 +34,191 @@ LLM_MODEL = os.getenv(
 )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
+USE_OLLAMA_FALLBACK = os.getenv("USE_OLLAMA_FALLBACK", "false").lower() in ("1", "true", "yes")
 
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL",
-    "llama2"
-)
+MODEL_PATH = os.getenv("MODEL_PATH", "xgboost_price_model.pkl")
+ENCODERS_PATH = os.getenv("ENCODERS_PATH", "label_encoders.pkl")
 
-USE_OLLAMA_FALLBACK = (
-    os.getenv(
-        "USE_OLLAMA_FALLBACK",
-        "false"
-    ).lower()
-    in ("1", "true", "yes")
-)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # comma-separated or "*"
 
+# --- helper: parse allowed origins ---
+if ALLOWED_ORIGINS.strip() == "*":
+    cors_origins = ["*"]
+else:
+    cors_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 
+# --- load model & encoders ---
 try:
-    from utils.holiday_engine import get_event_context
-
-except Exception:
-
-    def get_event_context(
-        source: str = "amazon"
-    ):
-        return {
-            "date": None,
-            "platform": source,
-            "is_sale_event": 0,
-            "event_type": "regular"
-        }
-
-
-
-app = FastAPI()
-
-
-
-MODEL_PATH = os.getenv(
-    "MODEL_PATH",
-    "xgboost_price_model.pkl"
-)
-
-ENCODERS_PATH = os.getenv(
-    "ENCODERS_PATH",
-    "label_encoders.pkl"
-)
-
-
-try:
-
-    model = joblib.load(
-        MODEL_PATH
-    )
-
+    model = joblib.load(MODEL_PATH)
+    logger.info(f"Loaded model from {MODEL_PATH}")
 except Exception as e:
-
-    raise RuntimeError(
-        f"Failed to load model '{MODEL_PATH}': {e}"
-    )
-
+    logger.exception(f"Failed to load model '{MODEL_PATH}': {e}")
+    raise RuntimeError(f"Failed to load model '{MODEL_PATH}': {e}")
 
 try:
-
-    encoders = joblib.load(
-        ENCODERS_PATH
-    )
-
+    encoders = joblib.load(ENCODERS_PATH)
+    logger.info(f"Loaded encoders from {ENCODERS_PATH}")
 except Exception as e:
-
     encoders = {}
+    logger.warning(f"Warning: failed to load encoders '{ENCODERS_PATH}', continuing with empty encoders. Error: {e}")
 
-    print(
-        f"Warning: failed to load encoders "
-        f"'{ENCODERS_PATH}', continuing with empty encoders. "
-        f"Error: {e}"
-    )
+# --- try import holiday engine if provided ---
+try:
+    from utils.holiday_engine import get_event_context  # optional
+except Exception:
+    def get_event_context(source: str = "amazon"):
+        return {"date": None, "platform": source, "is_sale_event": 0, "event_type": "regular"}
 
+# --- FastAPI app ---
+app = FastAPI(title="Price Prediction / Analyst")
 
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# --- Pydantic input model ---
 class ProductInput(BaseModel):
-
     product: Dict[str, Any]
 
+# --- utilities ---
 
-def encode(
-    col: str,
-    value: Any
-) -> int:
 
+def encode(col: str, value: Any) -> int:
     le = encoders.get(col)
-
     if not le:
         return 0
-
-    value = str(value)
-
+    val = str(value)
     try:
-
-        if (
-            hasattr(le, "classes_")
-            and value in le.classes_
-        ):
-
-            return int(
-                le.transform([value])[0]
-            )
-
+        # scikit-learn LabelEncoder has attribute classes_
+        if hasattr(le, "classes_") and val in le.classes_:
+            return int(le.transform([val])[0])
     except Exception:
-
         return 0
-
     return 0
 
 
-
-
-def detect_fake_discount(
-    product: Dict[str, Any],
-    avg_price: float
-) -> str:
-
-    mrp = product.get(
-        "mrp",
-        0
-    ) or 0
-
-    current = product.get(
-        "currentPrice",
-        0
-    ) or 0
-
+def detect_fake_discount(product: Dict[str, Any], avg_price: float) -> str:
     try:
-
-        mrp = float(mrp)
-        current = float(current)
-
+        mrp = float(product.get("mrp", 0) or 0)
+        current = float(product.get("currentPrice", 0) or 0)
     except Exception:
-
         return "Unknown"
-
     if mrp == 0:
-
         return "Unknown"
-
-    discount = (
-        (mrp - current) /
-        mrp
-    ) * 100
-
-    if (
-        discount > 40
-        and abs(
-            current - avg_price
-        ) < max(
-            1.0,
-            avg_price * 0.05
-        )
-    ):
-
+    discount = ((mrp - current) / mrp) * 100
+    if discount > 40 and abs(current - avg_price) < max(1.0, avg_price * 0.05):
         return "Fake"
-
     return "Genuine"
 
 
-
-def get_confidence(
-    drop_percent: float,
-    trend: float,
-    volatility: float,
-    event: Dict[str, Any]
-) -> str:
-
+def get_confidence(drop_percent: float, trend: float, volatility: float, event: Dict[str, Any]) -> str:
     score = 0
-
     if drop_percent > 15:
         score += 2
-
     if abs(trend) > 500:
         score += 1
-
     if volatility > 300:
         score += 1
-
     if event.get("is_sale_event"):
         score += 2
-
     if score >= 4:
-
         return "High"
-
     elif score >= 2:
-
         return "Medium"
-
     return "Low"
 
 
-
-def extract_json_from_text(
-    text: Optional[str]
-) -> Optional[Dict[str, Any]]:
-
+def extract_json_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
     if not text or not isinstance(text, str):
-
         return None
-
     s = text.strip()
-
-    if (
-        s.startswith("```")
-        and s.endswith("```")
-    ):
-
+    # remove triple backticks wrapper, if present
+    if s.startswith("```") and s.endswith("```"):
         parts = s.split("```")
-
         for part in reversed(parts):
-
             part = part.strip()
-
             if part:
-
                 s = part
-
                 break
-
     first = s.find("{")
-
     last = s.rfind("}")
-
-    if (
-        first == -1
-        or last == -1
-        or last < first
-    ):
-
+    if first == -1 or last == -1 or last < first:
         return None
-
-    candidate = s[
-        first:last + 1
-    ]
-
+    candidate = s[first:last + 1]
     try:
-
-        return json.loads(
-            candidate
-        )
-
+        return json.loads(candidate)
     except Exception:
-
         try:
-
-            fixed = re.sub(
-                r'([{\s,])([a-zA-Z0-9_]+)\s*:',
-                r'\1"\2":',
-                candidate
-            )
-
-            fixed = fixed.replace(
-                "'",
-                '"'
-            )
-
-            return json.loads(
-                fixed
-            )
-
+            fixed = re.sub(r'([{\s,])([a-zA-Z0-9_]+)\s*:', r'\1"\2":', candidate)
+            fixed = fixed.replace("'", '"')
+            return json.loads(fixed)
         except Exception:
-
             return None
 
 
-# ============================================================
-# PARSE KEY VALUE RESPONSE
-# ============================================================
-
-def parse_kv_text(
-    text: Optional[str]
-) -> Optional[Dict[str, Any]]:
-
-    if (
-        not text
-        or not isinstance(text, str)
-    ):
-
+def parse_kv_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not text or not isinstance(text, str):
         return None
-
-    lines = [
-        line.strip()
-        for line in re.split(
-            r'[\r\n]+',
-            text
-        )
-        if line.strip()
-    ]
-
+    lines = [line.strip() for line in re.split(r'[\r\n]+', text) if line.strip()]
     result: Dict[str, Any] = {}
-
+    # simple parse of "Key: value" or "Key - value"
     for line in lines:
-
-        match = re.match(
-            r'^\s\*?([A-Za-z ]{3,30})\s*\*?\s*[:\-]\s*(.+)$',
-            line
-        )
-
-        if match:
-
-            key = (
-                match.group(1)
-                .strip()
-                .lower()
-            )
-
-            value = (
-                match.group(2)
-                .strip()
-            )
-
+        m = re.match(r'^\s\*?([A-Za-z0-9 _-]{2,60})\*?\s*[:\-]\s*(.+)$', line)
+        if m:
+            key = m.group(1).strip().lower()
+            value = m.group(2).strip()
             if "action" in key:
-
-                result["action"] = (
-                    value.upper()
-                )
-
+                result["action"] = value.upper()
             elif "confidence" in key:
-
-                result["confidence"] = (
-                    value.title()
-                )
-
-            elif (
-                "explanation" in key
-                or "reason" in key
-            ):
-
+                result["confidence"] = value.title()
+            elif "explanation" in key or "reason" in key:
                 result["explanation"] = value
-
-            elif (
-                "insight" in key
-                or "note" in key
-                or "summary" in key
-            ):
-
+            elif "insight" in key or "note" in key or "summary" in key:
                 result["insight"] = value
-
     if result:
-
         return result
-
-
-    action_match = re.search(
-        r'\b(BUY NOW|WAIT)\b',
-        text,
-        re.IGNORECASE
-    )
-
+    # fallback searches
+    action_match = re.search(r'\b(BUY NOW|WAIT)\b', text, re.IGNORECASE)
     if action_match:
-
-        result["action"] = (
-            action_match.group(0)
-            .upper()
-        )
-
-
-    confidence_match = re.search(
-        r'Confidence\s*[:\-]\s*(Low|Medium|High)',
-        text,
-        re.IGNORECASE
-    )
-
+        result["action"] = action_match.group(0).upper()
+    confidence_match = re.search(r'Confidence\s*[:\-]\s*(Low|Medium|High)', text, re.IGNORECASE)
     if confidence_match:
-
-        result["confidence"] = (
-            confidence_match.group(1)
-            .title()
-        )
-
-
-    sentences = re.split(
-        r'(?<=[.!?])\s+',
-        text
-    )
-
+        result["confidence"] = confidence_match.group(1).title()
+    # choose a long sentence as explanation
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     for sentence in sentences:
-
-        if (
-            len(sentence.strip()) > 15
-            and "action"
-            not in sentence.lower()
-            and "confidence"
-            not in sentence.lower()
-        ):
-
-            result.setdefault(
-                "explanation",
-                sentence.strip()
-            )
-
+        if len(sentence.strip()) > 15 and "action" not in sentence.lower() and "confidence" not in sentence.lower():
+            result.setdefault("explanation", sentence.strip())
             break
+    return result if result else None
 
 
-    return (
-        result
-        if result
-        else None
-    )
-
-
-
-def call_groq(
-    payload: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-
+def call_groq(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Call GROQ (or configured LLM endpoint) to parse the prices + produce a decision.
+    Returns dict like {"parsed": {...}} or None.
+    """
     if not GROQ_API_KEY:
-
-        print(
-            "GROQ_API_KEY missing; skipping GROQ call."
-        )
-
+        logger.debug("GROQ_API_KEY missing; skipping GROQ call.")
         return None
-
 
     system_instruction = (
         "You are an expert ecommerce pricing analyst. "
-        "Think step-by-step internally but do not output "
-        "chain-of-thought. "
-        "Use only the provided data. "
-        "Return strict JSON. "
-        "Use English only. "
+        "Think step-by-step internally but do not output chain-of-thought. "
+        "Use only the provided data. Return strict JSON. Use English only. "
         "Do not include future numeric price predictions."
     )
 
-
-    event = (
-        payload.get(
-            "eventContext"
-        )
-        or {}
-    )
-
-    event_type = event.get(
-        "event_type",
-        "unknown"
-    )
-
-    is_sale_event = event.get(
-        "is_sale_event",
-        0
-    )
-
-    historical_prices = payload.get(
-        "prices",
-        []
-    )
-
+    event = payload.get("eventContext") or {}
+    event_type = event.get("event_type", "unknown")
+    is_sale_event = event.get("is_sale_event", 0)
+    historical_prices = payload.get("prices", [])
 
     user_data = (
         "DATA:\n"
@@ -491,1339 +228,340 @@ def call_groq(
         f"- Volatility: {payload.get('volatility')}\n"
         f"- Event Type: {event_type}\n"
         f"- Is Sale Event: {is_sale_event}\n"
-        f"- Historical Prices: "
-        f"{json.dumps(historical_prices)}\n\n"
-
+        f"- Historical Prices: {json.dumps(historical_prices)}\n\n"
         "INSTRUCTIONS:\n"
-
         "Return exactly one JSON object:\n"
-
-        "{\n"
-        '  "action": "BUY NOW" or "WAIT",\n'
-        '  "confidence": "Low", "Medium", or "High",\n'
-        '  "explanation": "1-3 sentence English explanation",\n'
-        '  "insight": "1-2 word English insight"\n'
-        "}\n\n"
-
-        "Do not output a future price.\n"
-        "Do not output chain-of-thought.\n"
-        "Use English only."
+        '{ "action": "BUY NOW" or "WAIT", "confidence": "Low"|"Medium"|"High", "explanation": "1-3 sentence explanation", "insight": "1-2 word insight" }\n'
+        "Do not output a future price. Do not output chain-of-thought. Use English only."
     )
 
-
     body = {
-
         "model": LLM_MODEL,
-
         "messages": [
-
-            {
-                "role": "system",
-                "content":
-                    system_instruction
-            },
-
-            {
-                "role": "user",
-                "content":
-                    user_data
-            }
-
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_data}
         ],
-
         "max_tokens": 400
     }
 
-
     for attempt in range(2):
-
         try:
-
-            response = requests.post(
-
+            resp = requests.post(
                 LLM_ENDPOINT,
-
-                headers={
-                    "Authorization":
-                        f"Bearer {GROQ_API_KEY}",
-
-                    "Content-Type":
-                        "application/json"
-                },
-
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json=body,
-
-                timeout=15
+                timeout=15,
             )
-
-
-            print(
-                "GROQ STATUS:",
-                response.status_code
-            )
-
-
-            if response.status_code != 200:
-
-                print(
-                    "GROQ ERROR BODY:",
-                    response.text[:1000]
-                )
-
+            logger.debug("GROQ status: %s", resp.status_code)
+            if resp.status_code != 200:
+                logger.warning("GROQ error (%s): %s", resp.status_code, resp.text[:500])
                 time.sleep(0.5)
-
                 continue
-
-
-            data = response.json()
-
+            data = resp.json()
             raw = None
-
-
             try:
-
-                raw = (
-                    data
-                    .get("choices", [])[0]
-                    .get("message", {})
-                    .get("content")
-                )
-
+                raw = data.get("choices", [])[0].get("message", {}).get("content")
             except Exception:
-
                 try:
-
-                    raw = (
-                        data
-                        .get("choices", [])[0]
-                        .get("text")
-                    )
-
+                    raw = data.get("choices", [])[0].get("text")
                 except Exception:
-
                     raw = None
-
-
-            parsed = extract_json_from_text(
-                raw
-            )
-
-
-            if (
-                parsed
-                and isinstance(
-                    parsed,
-                    dict
-                )
-            ):
-
+            parsed = extract_json_from_text(raw)
+            if parsed and isinstance(parsed, dict):
                 if "action" in parsed:
-
-                    parsed["action"] = (
-                        parsed["action"]
-                        .upper()
-                    )
-
-                return {
-                    "parsed": parsed
-                }
-
-
-            kv = parse_kv_text(
-                raw
-            )
-
-
+                    parsed["action"] = parsed["action"].upper()
+                return {"parsed": parsed}
+            kv = parse_kv_text(raw)
             if kv:
-
                 if "action" in kv:
-
-                    kv["action"] = (
-                        kv["action"]
-                        .upper()
-                    )
-
+                    kv["action"] = kv["action"].upper()
                 if "confidence" in kv:
-
-                    kv["confidence"] = (
-                        kv["confidence"]
-                        .title()
-                    )
-
-                return {
-                    "parsed": kv
-                }
-
-
-            return {
-                "parsed": None
-            }
-
-
+                    kv["confidence"] = kv["confidence"].title()
+                return {"parsed": kv}
+            return {"parsed": None}
         except Exception as e:
-
-            print(
-                "GROQ CALL EXCEPTION:",
-                str(e)
-            )
-
+            logger.exception("GROQ call exception: %s", e)
             time.sleep(0.5)
-
-
     return None
 
 
-
-def call_ollama(
-    payload: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-
+def call_ollama(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not OLLAMA_URL:
-
         return None
-
-
-    event = (
-        payload.get(
-            "eventContext"
-        )
-        or {}
-    )
-
-    event_type = event.get(
-        "event_type",
-        "unknown"
-    )
-
-    is_sale_event = event.get(
-        "is_sale_event",
-        0
-    )
-
-    historical_prices = payload.get(
-        "prices",
-        []
-    )
-
-
+    event = payload.get("eventContext") or {}
+    event_type = event.get("event_type", "unknown")
+    is_sale_event = event.get("is_sale_event", 0)
+    historical_prices = payload.get("prices", [])
     prompt = (
-
-        "You are an expert ecommerce pricing analyst. "
-
-        "Use only the provided data. "
-
-        "Return exactly one JSON object. "
-
-        "Use English only. "
-
-        "Do not output a future price. "
-
-        "\n\nDATA:\n"
-
-        f"- Current Price: "
-        f"{payload.get('currentPrice')}\n"
-
-        f"- Expected Drop Percent: "
-        f"{payload.get('expectedDropPercent')}\n"
-
-        f"- Price Trend: "
-        f"{payload.get('priceTrend')}\n"
-
-        f"- Volatility: "
-        f"{payload.get('volatility')}\n"
-
-        f"- Event Type: "
-        f"{event_type}\n"
-
-        f"- Is Sale Event: "
-        f"{is_sale_event}\n"
-
-        f"- Historical Prices: "
-        f"{json.dumps(historical_prices)}\n\n"
-
-        'Schema: '
-        '{"action":"BUY NOW"|"WAIT",'
-        '"confidence":"Low"|"Medium"|"High",'
-        '"explanation":"English explanation",'
-        '"insight":"1-2 words"}'
+        "You are an expert ecommerce pricing analyst. Use only the provided data. "
+        "Return exactly one JSON object. Use English only. Do not output a future price.\n\n"
+        f"- Current Price: {payload.get('currentPrice')}\n"
+        f"- Expected Drop Percent: {payload.get('expectedDropPercent')}\n"
+        f"- Price Trend: {payload.get('priceTrend')}\n"
+        f"- Volatility: {payload.get('volatility')}\n"
+        f"- Event Type: {event_type}\n"
+        f"- Is Sale Event: {is_sale_event}\n"
+        f"- Historical Prices: {json.dumps(historical_prices)}\n\n"
+        "Schema: {\"action\":\"BUY NOW\"|\"WAIT\", \"confidence\":\"Low\"|\"Medium\"|\"High\", \"explanation\":\"...\",\"insight\":\"...\"}"
     )
-
 
     try:
-
-        response = requests.post(
-
+        resp = requests.post(
             f"{OLLAMA_URL.rstrip('/')}/api/generate",
-
-            json={
-
-                "model":
-                    OLLAMA_MODEL,
-
-                "prompt":
-                    prompt,
-
-                "max_tokens":
-                    400
-            },
-
-            timeout=10
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "max_tokens": 400},
+            timeout=10,
         )
-
-
-        print(
-            "OLLAMA STATUS:",
-            response.status_code
-        )
-
-
-        if response.status_code != 200:
-
-            print(
-                "OLLAMA BODY:",
-                response.text[:1000]
-            )
-
+        logger.debug("OLLAMA status: %s", resp.status_code)
+        if resp.status_code != 200:
+            logger.warning("OLLAMA body: %s", resp.text[:500])
             return None
-
-
-        data = response.json()
-
+        data = resp.json()
         raw = None
-
-
-        if isinstance(
-            data,
-            dict
-        ):
-
-            raw = (
-                data.get(
-                    "response"
-                )
-                or (
-                    data
-                    .get(
-                        "generations",
-                        [{}]
-                    )[0]
-                    .get("text")
-                    if data.get(
-                        "generations"
-                    )
-                    else None
-                )
-            )
-
-
+        if isinstance(data, dict):
+            raw = data.get("response") or (data.get("generations", [{}])[0].get("text") if data.get("generations") else None)
         if not raw:
-
-            raw = json.dumps(
-                data
-            )
-
-
-        parsed = extract_json_from_text(
-            raw
-        )
-
-
-        if (
-            parsed
-            and isinstance(
-                parsed,
-                dict
-            )
-        ):
-
+            raw = json.dumps(data)
+        parsed = extract_json_from_text(raw)
+        if parsed and isinstance(parsed, dict):
             if "action" in parsed:
-
-                parsed["action"] = (
-                    parsed["action"]
-                    .upper()
-                )
-
-            return {
-                "parsed": parsed
-            }
-
-
-        kv = parse_kv_text(
-            raw
-        )
-
-
+                parsed["action"] = parsed["action"].upper()
+            return {"parsed": parsed}
+        kv = parse_kv_text(raw)
         if kv:
-
             if "action" in kv:
-
-                kv["action"] = (
-                    kv["action"]
-                    .upper()
-                )
-
+                kv["action"] = kv["action"].upper()
             if "confidence" in kv:
-
-                kv["confidence"] = (
-                    kv["confidence"]
-                    .title()
-                )
-
-            return {
-                "parsed": kv
-            }
-
-
-        return {
-            "parsed": None
-        }
-
-
+                kv["confidence"] = kv["confidence"].title()
+            return {"parsed": kv}
+        return {"parsed": None}
     except Exception as e:
-
-        print(
-            "OLLAMA CALL EXCEPTION:",
-            str(e)
-        )
-
+        logger.exception("OLLAMA exception: %s", e)
         return None
 
 
-
-
-def call_llm_analytical(
-    payload: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-
-    groq_response = call_groq(
-        payload
-    )
-
-    if (
-        groq_response
-        and groq_response.get(
-            "parsed"
-        )
-    ):
-
-        return {
-            "provider": "groq",
-            **groq_response
-        }
-
-
-    if (
-        USE_OLLAMA_FALLBACK
-        and OLLAMA_URL
-    ):
-
-        print(
-            "GROQ failed/unparseable. "
-            "Trying Ollama fallback."
-        )
-
-        ollama_response = call_ollama(
-            payload
-        )
-
-        if (
-            ollama_response
-            and ollama_response.get(
-                "parsed"
-            )
-        ):
-
-            return {
-                "provider": "ollama",
-                **ollama_response
-            }
-
-
+def call_llm_analytical(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    groq_response = call_groq(payload)
+    if groq_response and groq_response.get("parsed"):
+        return {"provider": "groq", **groq_response}
+    if USE_OLLAMA_FALLBACK and OLLAMA_URL:
+        logger.info("GROQ failed or unparseable, trying Ollama fallback.")
+        ollama_response = call_ollama(payload)
+        if ollama_response and ollama_response.get("parsed"):
+            return {"provider": "ollama", **ollama_response}
     return None
 
 
-
-
-def fallback_decision(
-    ml_result: Dict[str, Any]
-) -> Dict[str, Any]:
-
-    drop = ml_result.get(
-        "expectedDropPercent",
-        0
-    )
-
-    trend = ml_result.get(
-        "priceTrend",
-        0
-    )
-
-    event = (
-        ml_result.get(
-            "eventContext"
-        )
-        or {}
-    )
-
-
-    if (
-        drop > 15
-        or event.get(
-            "is_sale_event"
-        ) == 1
-        or trend < -500
-    ):
-
+def fallback_decision(ml_result: Dict[str, Any]) -> Dict[str, Any]:
+    drop = ml_result.get("expectedDropPercent", 0)
+    trend = ml_result.get("priceTrend", 0)
+    event = ml_result.get("eventContext") or {}
+    if drop > 15 or event.get("is_sale_event") == 1 or trend < -500:
         action = "WAIT"
-
-        confidence = (
-            "High"
-            if (
-                drop > 15
-                or trend < -500
-            )
-            else "Medium"
-        )
-
-        explanation = (
-            f"An estimated price drop of "
-            f"{round(drop, 2)}% and the current "
-            f"sale or price trend suggest waiting."
-        )
-
-        insight = (
-            "Sale imminent"
-            if event.get(
-                "is_sale_event"
-            ) == 1
-            else "Monitor"
-        )
-
-
-    elif (
-        drop < 5
-        and trend >= 0
-    ):
-
+        confidence = "High" if (drop > 15 or trend < -500) else "Medium"
+        explanation = f"An estimated price drop of {round(drop, 2)}% and the current sale or price trend suggest waiting."
+        insight = "Sale imminent" if event.get("is_sale_event") == 1 else "Monitor"
+    elif drop < 5 and trend >= 0:
         action = "BUY NOW"
-
         confidence = "Medium"
-
-        explanation = (
-            "The expected price drop is small "
-            "and the current price trend is stable."
-        )
-
+        explanation = "The expected price drop is small and the current price trend is stable."
         insight = "Buy now"
-
-
     else:
-
         action = "WAIT"
-
         confidence = "Medium"
-
-        explanation = (
-            f"The price trend shows moderate "
-            f"uncertainty with an estimated "
-            f"drop of {round(drop, 2)}%."
-        )
-
+        explanation = f"The price trend shows moderate uncertainty with an estimated drop of {round(drop, 2)}%."
         insight = "Monitor"
+    return {"action": action, "confidence": confidence, "explanation": explanation, "insight": insight}
 
 
-    return {
-
-        "action":
-            action,
-
-        "confidence":
-            confidence,
-
-        "explanation":
-            explanation,
-
-        "insight":
-            insight
-    }
-
-
-# ============================================================
-# SHORT INSIGHT
-# ============================================================
-
-def short_insight(
-    event: Dict[str, Any],
-    volatility: float,
-    drop_percent: float,
-    trend: float
-) -> str:
-
-    if event.get(
-        "is_sale_event"
-    ) == 1:
-
+def short_insight(event: Dict[str, Any], volatility: float, drop_percent: float, trend: float) -> str:
+    if event.get("is_sale_event") == 1:
         return "Sale imminent"
-
-
     if volatility >= 800:
-
         return "High volatility"
-
-
     if drop_percent >= 15:
-
         return "Good deal"
-
-
     if trend < -500:
-
         return "Dropping"
-
-
     return "Monitor"
 
+# --- endpoints ---
 
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 
 @app.post("/predict")
-def predict(
-    data: ProductInput
-):
+def predict(data: ProductInput):
+    product = data.product or {}
 
-    product = (
-        data.product
-        or {}
-    )
-
-
-
-
+    # parse numeric fields defensively
     try:
-
-        current_price = float(
-            product.get(
-                "currentPrice",
-                0
-            )
-            or 0
-        )
-
+        current_price = float(product.get("currentPrice", 0) or 0)
     except Exception:
-
         current_price = 0.0
-
-
     try:
-
-        mrp = float(
-            product.get(
-                "mrp",
-                current_price
-            )
-            or current_price
-        )
-
+        mrp = float(product.get("mrp", current_price) or current_price)
     except Exception:
-
         mrp = current_price
-
-
     try:
-
-        rating = float(
-            product.get(
-                "rating",
-                4.0
-            )
-            or 4.0
-        )
-
+        rating = float(product.get("rating", 4.0) or 4.0)
     except Exception:
-
         rating = 4.0
-
-
     try:
-
-        review_count = float(
-            product.get(
-                "reviewCount",
-                500
-            )
-            or 500
-        )
-
+        review_count = float(product.get("reviewCount", 500) or 500)
     except Exception:
-
         review_count = 500.0
 
-
-
-    discount_percent = (
-
-        (
-            mrp -
-            current_price
-        )
-        / mrp
-        * 100
-
-        if mrp > 0
-        else 0.0
-    )
-
-
-
+    discount_percent = ((mrp - current_price) / mrp * 100) if mrp > 0 else 0.0
     dt = datetime.now()
-
-    is_weekend = (
-        1
-        if dt.weekday() >= 5
-        else 0
-    )
-
-
-    event = (
-        get_event_context(
-            product.get(
-                "source",
-                "amazon"
-            )
-        )
-        or {}
-    )
-
-
-
-
-    history = (
-        product.get(
-            "history",
-            []
-        )
-        or []
-    )
-
+    is_weekend = 1 if dt.weekday() >= 5 else 0
+    event = get_event_context(product.get("source", "amazon")) or {}
+    history = product.get("history", []) or []
 
     prices = []
-
-
     for item in history:
-
         try:
-
-            if isinstance(
-                item,
-                dict
-            ):
-
-                price = item.get(
-                    "price",
-                    0
-                )
-
-                prices.append(
-                    float(price)
-                )
-
+            if isinstance(item, dict):
+                price = item.get("price", 0)
+                prices.append(float(price))
             else:
-
-                prices.append(
-                    float(item)
-                )
-
+                prices.append(float(item))
         except Exception:
-
             continue
 
+    if len(prices) == 0 or (len(prices) > 0 and prices[-1] != current_price):
+        prices.append(current_price)
 
-    if (
-        len(prices) == 0
-        or prices[-1] != current_price
-    ):
-
-        prices.append(
-            current_price
-        )
-
-
- 
-
-    avg_price = (
-        float(
-            np.mean(prices)
-        )
-        if prices
-        else current_price
-    )
-
-
-    min_price = (
-        float(
-            np.min(prices)
-        )
-        if prices
-        else current_price
-    )
-
-
-    max_price = (
-        float(
-            np.max(prices)
-        )
-        if prices
-        else current_price
-    )
-
-
-    volatility = (
-        float(
-            np.std(prices)
-        )
-        if prices
-        else 0.0
-    )
-
-
-    trend = (
-
-        float(
-            prices[-1]
-            - prices[-2]
-        )
-
-        if len(prices) >= 2
-        else 0.0
-    )
-
-
+    avg_price = float(np.mean(prices)) if prices else current_price
+    min_price = float(np.min(prices)) if prices else current_price
+    max_price = float(np.max(prices)) if prices else current_price
+    volatility = float(np.std(prices)) if prices else 0.0
+    trend = float(prices[-1] - prices[-2]) if len(prices) >= 2 else 0.0
 
     row = {
-
-        "price":
-            current_price,
-
-        "discount_percent":
-            discount_percent,
-
-        "quantity_sold":
-            100,
-
-        "rating":
-            rating,
-
-        "review_count":
-            review_count,
-
-        "product_category":
-            encode(
-                "product_category",
-                product.get(
-                    "category",
-                    "Electronics"
-                )
-            ),
-
-        "customer_region":
-            encode(
-                "customer_region",
-                "India"
-            ),
-
-        "payment_method":
-            encode(
-                "payment_method",
-                "UPI"
-            ),
-
-        "platform":
-            encode(
-                "platform",
-                product.get(
-                    "source",
-                    "amazon"
-                )
-            ),
-
-        "is_sale_event":
-            event.get(
-                "is_sale_event",
-                0
-            ),
-
-        "event_type":
-            encode(
-                "event_type",
-                event.get(
-                    "event_type",
-                    "regular"
-                )
-            ),
-
-        "is_weekend":
-            is_weekend,
-
-        "year":
-            dt.year,
-
-        "month":
-            dt.month,
-
-        "day":
-            dt.day,
-
-        "weekday":
-            dt.weekday()
+        "price": current_price,
+        "discount_percent": discount_percent,
+        "quantity_sold": 100,
+        "rating": rating,
+        "review_count": review_count,
+        "product_category": encode("product_category", product.get("category", "Electronics")),
+        "customer_region": encode("customer_region", "India"),
+        "payment_method": encode("payment_method", "UPI"),
+        "platform": encode("platform", product.get("source", "amazon")),
+        "is_sale_event": event.get("is_sale_event", 0),
+        "event_type": encode("event_type", event.get("event_type", "regular")),
+        "is_weekend": is_weekend,
+        "year": dt.year,
+        "month": dt.month,
+        "day": dt.day,
+        "weekday": dt.weekday()
     }
 
-
-    input_df = pd.DataFrame(
-        [row]
-    )
-
-
+    input_df = pd.DataFrame([row])
 
     try:
-
-        predicted_price = float(
-            model.predict(
-                input_df
-            )[0]
-        )
-
+        predicted_price = float(model.predict(input_df)[0])
     except Exception as e:
+        logger.exception("Model predict error: %s", e)
+        raise HTTPException(status_code=500, detail={"success": False, "message": "Model prediction failed", "error": str(e)})
 
-        print(
-            "MODEL PREDICT ERROR:",
-            str(e)
-        )
-
-        return {
-
-            "success":
-                False,
-
-            "message":
-                "Model prediction failed",
-
-            "error":
-                str(e)
-        }
-
-
-
-
-    future_price_internal = (
-
-        predicted_price * 0.2
-
-        + avg_price * 0.5
-
-        + current_price * 0.3
-    )
-
-
+    future_price_internal = predicted_price * 0.2 + avg_price * 0.5 + current_price * 0.3
     if trend < 0:
-
-        future_price_internal -= (
-            abs(trend) * 0.3
-        )
-
+        future_price_internal -= abs(trend) * 0.3
     elif trend > 0:
-
-        future_price_internal += (
-            trend * 0.2
-        )
-
-
-    future_price_internal = max(
-
-        current_price * 0.8,
-
-        min(
-            future_price_internal,
-            current_price * 1.2
-        )
-    )
-
-
-
-    difference = (
-        current_price
-        - future_price_internal
-    )
-
-
-    rule_recommendation = (
-
-        "WAIT"
-        if difference > 100
-        else "BUY NOW"
-    )
-
-
-    if event.get(
-        "is_sale_event"
-    ):
-
-        rule_recommendation = (
-            "WAIT (SALE COMING)"
-        )
-
-
-    drop_percent = (
-
-        (
-            abs(difference)
-            / current_price
-        )
-        * 100
-
-        if current_price > 0
-        else 0.0
-    )
-
-
-
-    discount_check = (
-        detect_fake_discount(
-            product,
-            avg_price
-        )
-    )
-
-
-    fallback_confidence = (
-        get_confidence(
-            drop_percent,
-            trend,
-            volatility,
-            event
-        )
-    )
-
-
+        future_price_internal += trend * 0.2
+    future_price_internal = max(current_price * 0.8, min(future_price_internal, current_price * 1.2))
+    difference = current_price - future_price_internal
+    rule_recommendation = "WAIT" if difference > 100 else "BUY NOW"
+    if event.get("is_sale_event"):
+        rule_recommendation = "WAIT (SALE COMING)"
+    drop_percent = (abs(difference) / current_price * 100) if current_price > 0 else 0.0
+    discount_check = detect_fake_discount(product, avg_price)
+    fallback_confidence = get_confidence(drop_percent, trend, volatility, event)
 
     ml_result = {
-
-        "currentPrice":
-            current_price,
-
-        "expectedDropPercent":
-            round(
-                drop_percent,
-                2
-            ),
-
-        "priceTrend":
-            round(
-                trend,
-                2
-            ),
-
-        "volatility":
-            round(
-                volatility,
-                2
-            ),
-
-        "eventContext":
-            event,
-
-        "avgHistoricalPrice":
-            round(
-                avg_price,
-                2
-            ),
-
-        "lowestHistoricalPrice":
-            round(
-                min_price,
-                2
-            ),
-
-        "highestHistoricalPrice":
-            round(
-                max_price,
-                2
-            ),
-
-        "recommendation":
-            rule_recommendation,
-
-        "reason":
-            ""
+        "currentPrice": current_price,
+        "expectedDropPercent": round(drop_percent, 2),
+        "priceTrend": round(trend, 2),
+        "volatility": round(volatility, 2),
+        "eventContext": event,
+        "avgHistoricalPrice": round(avg_price, 2),
+        "lowestHistoricalPrice": round(min_price, 2),
+        "highestHistoricalPrice": round(max_price, 2),
+        "recommendation": rule_recommendation,
+        "reason": ""
     }
-
-
-
 
     llm_payload = {
-
-        "currentPrice":
-            ml_result[
-                "currentPrice"
-            ],
-
-        "expectedDropPercent":
-            ml_result[
-                "expectedDropPercent"
-            ],
-
-        "priceTrend":
-            ml_result[
-                "priceTrend"
-            ],
-
-        "volatility":
-            ml_result[
-                "volatility"
-            ],
-
-        "eventContext":
-            ml_result[
-                "eventContext"
-            ],
-
-        "prices":
-            prices
+        "currentPrice": ml_result["currentPrice"],
+        "expectedDropPercent": ml_result["expectedDropPercent"],
+        "priceTrend": ml_result["priceTrend"],
+        "volatility": ml_result["volatility"],
+        "eventContext": ml_result["eventContext"],
+        "prices": prices
     }
 
-
-
-    llm_response = (
-        call_llm_analytical(
-            llm_payload
-        )
-    )
-
-
+    # try LLM parse (optional)
+    llm_response = call_llm_analytical(llm_payload)
     explain_source = "llm"
-
-    valid_actions = {
-        "BUY NOW",
-        "WAIT"
-    }
-
+    valid_actions = {"BUY NOW", "WAIT"}
     llm_parsed = None
-
-
     if llm_response:
-
-        parsed = (
-            llm_response.get(
-                "parsed"
-            )
-        )
-
-        if (
-            parsed
-            and isinstance(
-                parsed,
-                dict
-            )
-        ):
-
+        parsed = llm_response.get("parsed")
+        if parsed and isinstance(parsed, dict):
             llm_parsed = parsed
 
-
- 
-
-    if (
-        not llm_parsed
-        or llm_parsed.get(
-            "action"
-        ) not in valid_actions
-    ):
-
-        llm_decision = (
-            fallback_decision(
-                ml_result
-            )
-        )
-
-        explain_source = (
-            "fallback"
-        )
-
-        llm_parsed = (
-            llm_decision
-        )
-
-
+    if not llm_parsed or llm_parsed.get("action") not in valid_actions:
+        llm_decision = fallback_decision(ml_result)
+        explain_source = "fallback"
+        llm_parsed = llm_decision
     else:
-
-        llm_parsed["action"] = (
-            llm_parsed
-            .get(
-                "action",
-                "WAIT"
-            )
-            .upper()
-        )
-
-
+        llm_parsed["action"] = llm_parsed.get("action", "WAIT").upper()
         if "confidence" in llm_parsed:
+            llm_parsed["confidence"] = llm_parsed["confidence"].title()
 
-            llm_parsed[
-                "confidence"
-            ] = (
-                llm_parsed[
-                    "confidence"
-                ]
-                .title()
-            )
-
-
-
-
-    final_action = (
-        llm_parsed.get(
-            "action",
-            "WAIT"
-        )
-    )
-
-
-    final_confidence = (
-        llm_parsed.get(
-            "confidence",
-            fallback_confidence
-        )
-    )
-
-
-    final_explanation = (
-        llm_parsed.get(
-            "explanation",
-            ""
-        )
-    )
-
-
-
-    final_explanation = re.sub(
-
-        r'\b('
-        r'futurePrice|'
-        r'future_price|'
-        r'predicted price|'
-        r'predicted'
-        r')\b'
-        r'[:\s]*[\d,.]+',
-
-        '',
-
-        final_explanation,
-
-        flags=re.IGNORECASE
-    )
-
-
-    final_explanation = (
-        final_explanation.strip()
-    )
-
-
+    final_action = llm_parsed.get("action", "WAIT")
+    final_confidence = llm_parsed.get("confidence", fallback_confidence)
+    final_explanation = llm_parsed.get("explanation", "")
+    # remove any accidental numeric "future price" mentions
+    final_explanation = re.sub(r'\b(futurePrice|future_price|predicted price|predicted)\b[:\s]*[\d,.]+', '', final_explanation, flags=re.IGNORECASE).strip()
     if not final_explanation:
-
         if final_action == "WAIT":
-
-            final_explanation = (
-                "The current price trend and "
-                "market conditions suggest waiting "
-                "for a potentially better price."
-            )
-
+            final_explanation = "The current price trend and market conditions suggest waiting for a potentially better price."
         else:
+            final_explanation = "The current price trend is stable and there is no strong indication of a significant price drop."
 
-            final_explanation = (
-                "The current price trend is stable "
-                "and there is no strong indication "
-                "of a significant price drop."
-            )
-
-
-
-
-    insight_short = (
-        short_insight(
-            event,
-            volatility,
-            drop_percent,
-            trend
-        )
-    )
-
-
+    insight_short = short_insight(event, volatility, drop_percent, trend)
 
     response = {
-
-        "success":
-            True,
-
-        "currentPrice":
-            ml_result[
-                "currentPrice"
-            ],
-
-        "finalDecision":
-            final_action,
-
-        "confidence":
-            final_confidence,
-
-        "explanation":
-            final_explanation,
-
-        "insight":
-            insight_short,
-
-        "explainSource":
-            explain_source,
-
-        "expectedDropPercent":
-            ml_result[
-                "expectedDropPercent"
-            ],
-
-        "priceTrend":
-            ml_result[
-                "priceTrend"
-            ],
-
-        "volatility":
-            ml_result[
-                "volatility"
-            ],
-
-        "eventContext":
-            ml_result[
-                "eventContext"
-            ],
-
-        "discountCheck":
-            discount_check,
-
-        "avgHistoricalPrice":
-            ml_result[
-                "avgHistoricalPrice"
-            ],
-
-        "lowestHistoricalPrice":
-            ml_result[
-                "lowestHistoricalPrice"
-            ],
-
-        "highestHistoricalPrice":
-            ml_result[
-                "highestHistoricalPrice"
-            ]
+        "success": True,
+        "currentPrice": ml_result["currentPrice"],
+        "finalDecision": final_action,
+        "confidence": final_confidence,
+        "explanation": final_explanation,
+        "insight": insight_short,
+        "explainSource": explain_source,
+        "expectedDropPercent": ml_result["expectedDropPercent"],
+        "priceTrend": ml_result["priceTrend"],
+        "volatility": ml_result["volatility"],
+        "eventContext": ml_result["eventContext"],
+        "discountCheck": discount_check,
+        "avgHistoricalPrice": ml_result["avgHistoricalPrice"],
+        "lowestHistoricalPrice": ml_result["lowestHistoricalPrice"],
+        "highestHistoricalPrice": ml_result["highestHistoricalPrice"],
     }
 
-
-    
-
-
     return response
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
